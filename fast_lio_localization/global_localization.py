@@ -58,7 +58,7 @@ class FastLIOLocalization(Node):
         self.get_logger().info("Global map received.")
         
         self.create_subscription(PointCloud2, "/cloud_registered", self.cb_save_cur_scan, 10)
-        self.create_subscription(Odometry, "/Odometry", self.cb_save_cur_odom, 10)
+        self.create_subscription(Odometry, "odom", self.cb_save_cur_odom, 10)
         self.create_subscription(PoseWithCovarianceStamped, "/initialpose", self.cb_initialize_pose, 10)
 
         self.timer_localisation = self.create_timer(1.0 / self.get_parameter("freq_localization").value, self.localisation_timer_callback)
@@ -84,12 +84,12 @@ class FastLIOLocalization(Node):
     
     def registration_at_scale(self, scan, map, initial, scale):
         result_icp = o3d.pipelines.registration.registration_icp(
-        self.voxel_down_sample(scan, self.get_parameter("scan_voxel_size").value * scale),
-        self.voxel_down_sample(map, self.get_parameter("map_voxel_size").value * scale),
-        1.0 * scale,
-        initial,
-        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20),
+            self.voxel_down_sample(scan, self.get_parameter("scan_voxel_size").value * scale),
+            self.voxel_down_sample(map, self.get_parameter("map_voxel_size").value * scale),
+            1.0 * scale,
+            initial,
+            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20),
         )
         return result_icp.transformation, result_icp.fitness
             
@@ -151,6 +151,7 @@ class FastLIOLocalization(Node):
         scan_tobe_mapped = copy.copy(self.cur_scan)
         global_map_in_FOV = self.crop_global_map_in_FOV(pose_estimation)
         
+        # Why do we do two registrations here, back to back? 
         transformation, _ = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=5)
         
         transformation, fitness = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=1)
@@ -180,6 +181,8 @@ class FastLIOLocalization(Node):
         pc = self.msg_to_array(msg)
         self.cur_scan = o3d.geometry.PointCloud()
         self.cur_scan.points = o3d.utility.Vector3dVector(pc)
+        # What is the point of publishing this? Other than just debugging it for a sanity check,
+        # maybe...
         self.publish_point_cloud(self.pub_pc_in_map, msg.header, pc)
         
     def initialize_global_map(self): #, pc_msg):
