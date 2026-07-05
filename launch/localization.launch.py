@@ -41,14 +41,7 @@ def generate_launch_description():
     declare_pcd_map_topic = DeclareLaunchArgument(
         "pcd_map_topic", default_value="/map", description="Topic to publish PCD map"
     )
-    # Load parameters from yaml file
 
-    fast_lio_node = Node(
-        package="fast_lio_localization",
-        executable="fastlio_mapping",
-        parameters=[PathJoinSubstitution([config_path, config_file]), {"use_sim_time": use_sim_time}],
-        output="screen",
-    )
     # Global localization node
     global_localization_node = Node(
         package="fast_lio_localization",
@@ -73,7 +66,7 @@ def generate_launch_description():
         name="transform_fusion",
         output="screen",
     )
-    
+
     # PCD to PointCloud2 publisher
     pcd_publisher_node = Node(
         package="pcl_ros",
@@ -100,7 +93,6 @@ def generate_launch_description():
     ld.add_action(declare_map_path)
     ld.add_action(declare_pcd_map_topic)
 
-    ld.add_action(fast_lio_node)
     ld.add_action(rviz_node)
     ld.add_action(global_localization_node)
     ld.add_action(transform_fusion_node)
