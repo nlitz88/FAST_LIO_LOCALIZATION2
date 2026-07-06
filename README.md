@@ -38,13 +38,6 @@ This part of dependency is consistent with FAST-LIO-ROS2, please refer to the do
 pip install tf_transformations
 ```
 
-- ros2_numpy
-```shell
-pip install ros2-numpy
-```
-
-check your numpy version, must be <1.24
-
 - [Open3D](https://www.open3d.org/docs/release/getting_started.html)
 
 ```shell

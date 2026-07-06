@@ -10,12 +10,22 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseWithCovarianceStamped, Pose, Point, Quaternion
 from nav_msgs.msg import Odometry
 # from rclpy.wait_for_message import wait_for_message
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import PointCloud2, PointField
+from sensor_msgs_py import point_cloud2 as pc2
 from std_msgs.msg import Header
 import numpy as np
 import tf2_ros
 import tf_transformations
-import ros2_numpy
+
+
+_FIELDS_XYZ = [
+    PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+    PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+    PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+]
+_FIELDS_XYZI = _FIELDS_XYZ + [
+    PointField(name="intensity", offset=12, datatype=PointField.FLOAT32, count=1),
+]
 
 
 class FastLIOLocalization(Node):
@@ -79,8 +89,7 @@ class FastLIOLocalization(Node):
         return trans
     
     def msg_to_array(self, pc_msg):
-        pc_array = ros2_numpy.numpify(pc_msg)
-        return pc_array["xyz"]
+        return pc2.read_points_numpy(pc_msg, field_names=("x", "y", "z"))
     
     def registration_at_scale(self, scan, map, initial, scale):
         result_icp = o3d.pipelines.registration.registration_icp(
@@ -102,20 +111,9 @@ class FastLIOLocalization(Node):
         return trans_inverse
 
     def publish_point_cloud(self, publisher, header, pc):
-        data = dict()
-        data["xyz"] = pc[:, :3]
-        
-        if pc.shape[1] == 4:
-            data["intensity"] = pc[:, 3]
-        # else:
-            # data["rgb"] = np.ones_like(pc)
-        msg = ros2_numpy.msgify(PointCloud2, data)
-        msg.header = header
-        if len(msg.fields) == 4:
-            msg.point_step = 16
-        else:
-            msg.point_step = 12
-            
+        pc = np.asarray(pc, dtype=np.float32)
+        fields = _FIELDS_XYZI if pc.shape[1] == 4 else _FIELDS_XYZ
+        msg = pc2.create_cloud(header, fields, pc[:, : len(fields)])
         publisher.publish(msg)
         
     def crop_global_map_in_FOV(self, pose_estimation):
