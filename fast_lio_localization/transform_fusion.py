@@ -11,7 +11,7 @@ from nav_msgs.msg import Odometry
 import rclpy.timer
 import tf_transformations
 import tf2_ros
-from geometry_msgs.msg import Transform
+from geometry_msgs.msg import Transform, TransformStamped
 from std_msgs.msg import Header
 
 
@@ -53,7 +53,7 @@ class TransformFusion(Node):
     # something), and then have that node handle publishing the map_from_odom transform.
 
     def transform_fusion(self):
-        if self.cur_odom_to_baselink is None:
+        if self.cur_odom_to_baselink is None or self.cur_map_to_odom is None:
             return
 
         if self.cur_map_to_odom is not None:
@@ -75,16 +75,18 @@ class TransformFusion(Node):
         
         header = Header()
         header.stamp = self.get_clock().now().to_msg()
-        header.frame_id = self.cur_odom_to_baselink.header.frame_id
+        header.frame_id = self.cur_map_to_odom.header.frame_id
         
         # print(self.cur_odom_to_baselink.header)
         transform_stamped_msg = tf2_ros.TransformStamped(
-                header = self.cur_odom_to_baselink.header,
-                child_frame_id = self.cur_odom_to_baselink.child_frame_id,
-                transform = transform_msg
-            )
+            header = header,
+            child_frame_id = self.cur_map_to_odom.child_frame_id,
+            transform = transform_msg
+        )
+        transform_stamped_msg.header.stamp = header.stamp
         transform_stamped_msg.header.frame_id = "map"
         self.tf_broadcaster.sendTransform(transform_stamped_msg)
+        # self.get_logger().info("Published map_from_odom transform")
 
         cur_odom = copy.copy(self.cur_odom_to_baselink)
         if cur_odom is not None:
@@ -103,7 +105,7 @@ class TransformFusion(Node):
 
             localization.header.stamp = self.get_clock().now().to_msg()
             localization.header.frame_id = "map"
-            localization.child_frame_id = "body"
+            localization.child_frame_id = self.cur_odom_to_baselink.child_frame_id
             self.pub_localization.publish(localization)
 
 

@@ -209,6 +209,7 @@ class FastLIOLocalization(Node):
         )
         odom_msg.header.stamp = self.get_clock().now().to_msg()
         odom_msg.header.frame_id = "map"
+        odom_msg.child_frame_id = "odom"
         self.pub_map_to_odom.publish(odom_msg)
 
     def localisation_timer_callback(self):
