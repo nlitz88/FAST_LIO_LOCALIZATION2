@@ -23,7 +23,7 @@ class TransformFusion(Node):
         self.cur_map_to_odom = None
 
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
-        self.pub_localization = self.create_publisher(Odometry, "/localization", 1)
+        self.pub_localization = self.create_publisher(Odometry, "/localization/odom", 1)
 
         self.create_subscription(Odometry, "/Odometry", self.cb_save_cur_odom, 1)
         self.create_subscription(Odometry, "/map_to_odom", self.cb_save_map_to_odom, 1)
@@ -38,6 +38,19 @@ class TransformFusion(Node):
         quat = [pose_msg.orientation.x, pose_msg.orientation.y, pose_msg.orientation.z, pose_msg.orientation.w]
         trans[:3, :3] = tf_transformations.quaternion_matrix(quat)[:3, :3]
         return trans
+    
+    # So, all this callback does is:
+    # 1. Publish the map_from_odom (or odom_from_map, not sure which) we get from the localization
+    #    node.
+    # 2. Takes the map_from_odom and composes it with the latest odom_from_base_link to create a
+    #    high rate map_from_base_link odometry message, and publishes that. This is kinda flawed,
+    #    though, as if the odom only publishes at 10 Hz, and this runs at 50 Hz, then this will end
+    #    up publishing duplicate odometry messages with redundant information. Okay for now, just a
+    #    prototype, but this is funky.
+
+    # Big picture, this whole node shouldn't really exist. Instead, the registrations from the
+    # localization node need to be fed into a global estimator (robot_localization ekf or
+    # something), and then have that node handle publishing the map_from_odom transform.
 
     def transform_fusion(self):
         if self.cur_odom_to_baselink is None:
@@ -67,7 +80,7 @@ class TransformFusion(Node):
         # print(self.cur_odom_to_baselink.header)
         transform_stamped_msg = tf2_ros.TransformStamped(
                 header = self.cur_odom_to_baselink.header,
-                child_frame_id = "camera_init",
+                child_frame_id = self.cur_odom_to_baselink.child_frame_id,
                 transform = transform_msg
             )
         transform_stamped_msg.header.frame_id = "map"
