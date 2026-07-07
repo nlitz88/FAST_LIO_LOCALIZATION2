@@ -15,7 +15,7 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
-            "global_localization = fast_lio_localization.global_localization:main",
+            "scan_matcher = fast_lio_localization.scan_matcher:main",
             "publish_initial_pose = fast_lio_localization.publish_initial_pose:main",
             "transform_fusion = fast_lio_localization.transform_fusion:main",
             "invert_livox_scan = fast_lio_localization.invert_livox_scan:main",

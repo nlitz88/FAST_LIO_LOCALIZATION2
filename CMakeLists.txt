@@ -132,7 +132,7 @@ install(
 
 # Install Python scripts
 install(PROGRAMS
-  fast_lio_localization/global_localization.py
+  fast_lio_localization/scan_matcher.py
   fast_lio_localization/publish_initial_pose.py
   fast_lio_localization/transform_fusion.py
   fast_lio_localization/invert_livox_scan.py
