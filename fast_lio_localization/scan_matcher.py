@@ -143,6 +143,7 @@ class ScanMatcher(Node):
         return global_map_in_FOV
 
     def global_localization(self):
+        t_start = self.get_clock().now()
         scan_tobe_mapped = copy.copy(self.cur_scan)
         scan_stamp = self.cur_scan_stamp
         T_prior = self.T_map_to_base_prior
@@ -157,6 +158,11 @@ class ScanMatcher(Node):
 
         if fitness > self.get_parameter("localization_threshold").value:
             self.publish_fix(transformation, scan_stamp)
+
+            now = self.get_clock().now()
+            icp_ms = int((now - t_start).nanoseconds) / 1e6
+            scan_age_ms = (now - rclpy.time.Time.from_msg(scan_stamp)).nanoseconds / 1e6
+            self.get_logger().info(f"fix published: fitness={fitness:.3f} icp={icp_ms:.0f}ms scan_age={scan_age_ms:.0f}ms")
 
             # Debug: current scan transformed into the map frame with the
             # refined pose; should visually align with the map in RViz.
