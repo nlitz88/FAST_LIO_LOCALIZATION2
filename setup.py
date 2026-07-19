@@ -19,6 +19,7 @@ setup(
             "scan_accumulator = fast_lio_localization.scan_accumulator:main",
             "publish_initial_pose = fast_lio_localization.publish_initial_pose:main",
             "map_odom_broadcaster = fast_lio_localization.map_odom_broadcaster:main",
+            "pseudo_estimator = fast_lio_localization.pseudo_estimator:main",
             "invert_livox_scan = fast_lio_localization.invert_livox_scan:main",
         ],
     },
