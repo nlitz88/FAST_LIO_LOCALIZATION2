@@ -175,12 +175,7 @@ class ScanMatcher(Node):
             self.get_logger().warn(f"Fitness score {fitness} less than localization threshold {self.get_parameter('localization_threshold').value}")
 
     def voxel_down_sample(self, pcd, voxel_size):
-        try:
-            pcd_down = pcd.voxel_down_sample(voxel_size)
-        except Exception as e:
-            # for opend3d 0.7 or lower
-            pcd_down = o3d.geometry.voxel_down_sample(pcd, voxel_size)
-        return pcd_down
+        return pcd.voxel_down_sample(voxel_size)
 
     def cb_save_prior(self, msg):
         self.T_map_to_base_prior = self.pose_to_mat(msg.pose.pose)
