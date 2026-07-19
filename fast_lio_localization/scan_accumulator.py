@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import collections
+import math
 
 import numpy as np
 import rclpy
@@ -24,21 +25,28 @@ _FIELDS_XYZI = [
 
 
 class ScanAccumulator(Node):
-    """Accumulates the last N deskewed scans from FAST-LIO into a denser
+    """Maintains a local submap of distance-gated keyframe scans from
+    FAST-LIO and publishes it, plus the current scan, as one dense
     "virtual scan" for the scan matcher.
 
     Each incoming scan is transformed into the odom frame using the
     odom -> scan-frame tf at the scan's own timestamp. FAST-LIO's tf is
     the exact state pose it registered the scan with, so this reproduces
-    its own world registration with no extra drift. On every scan, the
-    ring buffer's contents are concatenated, re-expressed in base_frame
-    at the newest scan's timestamp, and published -- so the scan matcher
-    is effectively aligning that latest scan, just with a denser cloud.
+    its own world registration with no extra drift. A scan is *retained*
+    as a keyframe only when the robot has translated keyframe_dist_m or
+    rotated keyframe_rot_deg since the last keyframe -- consecutive scans
+    are nearly identical, so the ring buffer instead spans a trail of
+    roughly n_scans * keyframe_dist_m meters behind the robot, and it
+    freezes (rather than flushing the trail) while the robot idles.
+
+    On every scan, keyframes + the current scan are concatenated,
+    re-expressed in base_frame at the current scan's timestamp, and
+    published -- so the scan matcher always aligns the robot's current
+    view, with the submap trail providing extra constraint.
 
     Future work:
       - per-scan voxel downsampling (_per_scan_filter) to bound memory/CPU
       - output voxel/range filtering (_output_filter) to shrink messages
-      - distance/rotation-traveled gating instead of a count-based buffer
       - decoupled (lower) publish rate if a denser lidar makes per-scan
         publishing expensive
     """
@@ -49,6 +57,8 @@ class ScanAccumulator(Node):
             namespace="",
             parameters=[
                 ("n_scans", 10),
+                ("keyframe_dist_m", 1.0),
+                ("keyframe_rot_deg", 30.0),
                 ("odom_frame", "odom"),
                 ("base_frame", "base_link"),
                 ("tf_timeout", 0.1),
@@ -57,6 +67,8 @@ class ScanAccumulator(Node):
 
         # (stamp, Nx4 float32 array of xyz+intensity, already in odom frame)
         self.scans = collections.deque(maxlen=self.get_parameter("n_scans").value)
+        # 4x4 odom pose of the last retained keyframe's scan frame.
+        self.T_last_keyframe = None
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -113,6 +125,18 @@ class ScanAccumulator(Node):
         # Seam for future output voxel/range filtering.
         return points
 
+    def is_keyframe(self, T_odom_to_scan):
+        """True when the robot has moved far enough from the last keyframe
+        that this scan adds meaningfully new geometry to the submap."""
+        if self.T_last_keyframe is None:
+            return True
+        T_rel = np.matmul(self.inverse_se3(self.T_last_keyframe), T_odom_to_scan)
+        if np.linalg.norm(T_rel[:3, 3]) >= self.get_parameter("keyframe_dist_m").value:
+            return True
+        # Relative rotation angle from the trace of the rotation block.
+        cos_angle = np.clip((np.trace(T_rel[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)
+        return math.degrees(math.acos(cos_angle)) >= self.get_parameter("keyframe_rot_deg").value
+
     def cb_scan(self, msg):
         stamp = rclpy.time.Time.from_msg(msg.header.stamp)
 
@@ -122,6 +146,7 @@ class ScanAccumulator(Node):
             if stamp < newest - Duration(seconds=1.0):
                 self.get_logger().warn("Scan stamp jumped backwards; clearing accumulated scans.")
                 self.scans.clear()
+                self.T_last_keyframe = None
 
         T_odom_to_scan = self.lookup_mat(
             self.get_parameter("odom_frame").value, msg.header.frame_id, msg.header.stamp
@@ -134,17 +159,27 @@ class ScanAccumulator(Node):
             return
         points = self.transform_points(T_odom_to_scan, points)
         points = self._per_scan_filter(points)
-        self.scans.append((msg.header.stamp, points))
 
-        self.publish_accumulated(msg.header.stamp)
+        if self.is_keyframe(T_odom_to_scan):
+            self.scans.append((msg.header.stamp, points))
+            self.T_last_keyframe = T_odom_to_scan
+            self.get_logger().debug(f"Keyframe added ({len(self.scans)} in buffer).")
+            self.publish_accumulated(msg.header.stamp)
+        else:
+            # Not retained, but the current view always heads the output so
+            # the scan matcher aligns what the robot sees right now.
+            self.publish_accumulated(msg.header.stamp, current_points=points)
 
-    def publish_accumulated(self, stamp):
+    def publish_accumulated(self, stamp, current_points=None):
         base_frame = self.get_parameter("base_frame").value
         T_odom_to_base = self.lookup_mat(self.get_parameter("odom_frame").value, base_frame, stamp)
         if T_odom_to_base is None:
             return
 
-        cloud = np.concatenate([points for _, points in self.scans])
+        clouds = [points for _, points in self.scans]
+        if current_points is not None:
+            clouds.append(current_points)
+        cloud = np.concatenate(clouds)
         cloud = self.transform_points(self.inverse_se3(T_odom_to_base), cloud)
         cloud = self._output_filter(cloud)
 
