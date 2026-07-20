@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import copy
 import time
 
 import open3d as o3d
@@ -40,8 +39,12 @@ class ScanMatcher(Node):
         # Latest map->base_link estimate from the global estimator, used as
         # the ICP prior. None until the first estimate arrives.
         self.T_map_to_base_prior = None
-        self.cur_scan = None
-        self.cur_scan_stamp = None
+        # Raw scan message from the most recent /accumulated_scan callback
+        # (10Hz). Only converted into an Open3D cloud on demand by
+        # get_cur_scan(), since the ~0.5Hz localization timer only ever
+        # needs the single latest one -- converting on every callback would
+        # waste ~19 out of 20 conversions.
+        self.latest_scan_msg = None
         # Static base_link <- scan frame extrinsic, cached after first lookup.
         self.T_base_to_scan_frame = None
 
@@ -145,8 +148,9 @@ class ScanMatcher(Node):
 
     def global_localization(self):
         t_start = self.get_clock().now()
-        scan_tobe_mapped = copy.copy(self.cur_scan)
-        scan_stamp = self.cur_scan_stamp
+        scan_tobe_mapped, scan_stamp = self.get_cur_scan()
+        if scan_tobe_mapped is None:
+            return
         T_prior = self.T_map_to_base_prior
         n_scan_pts = len(scan_tobe_mapped.points)
 
@@ -209,25 +213,28 @@ class ScanMatcher(Node):
         return self.T_base_to_scan_frame
 
     def cb_save_cur_scan(self, msg):
+        self.latest_scan_msg = msg
+
+    def get_cur_scan(self):
+        """Converts the latest raw scan message into an Open3D cloud in
+        base_frame, on demand. Returns (scan, stamp), or (None, None) if no
+        scan has arrived yet or its extrinsic isn't available."""
+        msg = self.latest_scan_msg
+        if msg is None:
+            return None, None
         T_base_to_scan = self.lookup_scan_extrinsic(msg.header.frame_id)
         if T_base_to_scan is None:
-            return
+            return None, None
         t0 = time.perf_counter()
         pc = self.transform_points(T_base_to_scan, self.msg_to_array(msg))
         scan = o3d.geometry.PointCloud()
         scan.points = o3d.utility.Vector3dVector(pc)
         dt_ms = (time.perf_counter() - t0) * 1e3
-        # This callback runs once per incoming scan (subscription rate), but
-        # only the most recent conversion is ever used by the ~0.5Hz
-        # localization timer -- so its steady-state CPU cost is this
-        # per-call time times the *subscription* rate, not the timer rate.
-        # Throttled log surfaces that steady-state cost.
         self.get_logger().debug(
-            f"cb_save_cur_scan: {len(pc)} pts, convert={dt_ms:.1f}ms",
+            f"get_cur_scan: {len(pc)} pts, convert={dt_ms:.1f}ms",
             throttle_duration_sec=2.0,
         )
-        self.cur_scan = scan
-        self.cur_scan_stamp = msg.header.stamp
+        return scan, msg.header.stamp
 
     def initialize_global_map(self):
         map_path = self.get_parameter("pcd_map_path").value
@@ -265,7 +272,7 @@ class ScanMatcher(Node):
         if self.T_map_to_base_prior is None:
             self.get_logger().info("Waiting for prior from global estimator...", throttle_duration_sec=5.0)
             return
-        if self.cur_scan is None:
+        if self.latest_scan_msg is None:
             self.get_logger().info("Waiting for first scan...", throttle_duration_sec=5.0)
             return
         self.global_localization()

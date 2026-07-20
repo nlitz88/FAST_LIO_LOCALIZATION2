@@ -40,13 +40,15 @@ class ScanAccumulator(Node):
     freezes (rather than flushing the trail) while the robot idles.
 
     On every scan, keyframes + the current scan are concatenated,
+    voxel-downsampled to collapse cross-keyframe overlap (_output_filter),
     re-expressed in base_frame at the current scan's timestamp, and
     published -- so the scan matcher always aligns the robot's current
     view, with the submap trail providing extra constraint.
 
     Future work:
       - per-scan voxel downsampling (_per_scan_filter) to bound memory/CPU
-      - output voxel/range filtering (_output_filter) to shrink messages
+        further, if a denser lidar ever makes individual scans themselves
+        heavy (see docs/2026-07-scan-accumulator-submap.md)
       - decoupled (lower) publish rate if a denser lidar makes per-scan
         publishing expensive
     """
@@ -62,6 +64,7 @@ class ScanAccumulator(Node):
                 ("odom_frame", "odom"),
                 ("base_frame", "base_link"),
                 ("tf_timeout", 0.1),
+                ("output_voxel_size", 0.1),
             ],
         )
 
@@ -122,8 +125,28 @@ class ScanAccumulator(Node):
         return points
 
     def _output_filter(self, points):
-        # Seam for future output voxel/range filtering.
-        return points
+        """Voxel-downsamples the concatenated submap so overlapping
+        keyframes collapse to one point per cell, instead of each
+        contributing near-duplicate points. Picks one representative point
+        per occupied voxel (first occurrence) rather than a true centroid
+        average -- cheap, vectorized, and sufficient for ICP correspondence,
+        which already tolerates offsets within a voxel_size.
+
+        Voxel indices are packed into a single int64 key (21 bits/axis, safe
+        for submap extents up to ~200km at this voxel_size) and deduplicated
+        with a 1-D np.unique -- np.unique(..., axis=0) on the raw Nx3 index
+        array is a well-known ~4-5x slower path in numpy (generic lexsort)
+        for the same result."""
+        if len(points) == 0:
+            return points
+        voxel_size = self.get_parameter("output_voxel_size").value
+        if voxel_size <= 0.0:
+            return points
+        voxel_idx = np.floor(points[:, :3] / voxel_size).astype(np.int64)
+        offset = voxel_idx - voxel_idx.min(axis=0)
+        keys = (offset[:, 0] << 42) | (offset[:, 1] << 21) | offset[:, 2]
+        _, unique_indices = np.unique(keys, return_index=True)
+        return points[unique_indices]
 
     def is_keyframe(self, T_odom_to_scan):
         """True when the robot has moved far enough from the last keyframe
