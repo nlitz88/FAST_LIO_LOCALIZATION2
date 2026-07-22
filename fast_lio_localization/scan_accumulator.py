@@ -2,6 +2,7 @@
 
 import collections
 import math
+from time import perf_counter
 
 import numpy as np
 import rclpy
@@ -65,6 +66,7 @@ class ScanAccumulator(Node):
                 ("base_frame", "base_link"),
                 ("tf_timeout", 0.1),
                 ("output_voxel_size", 0.1),
+                ("profile_timing", False),
             ],
         )
 
@@ -72,6 +74,16 @@ class ScanAccumulator(Node):
         self.scans = collections.deque(maxlen=self.get_parameter("n_scans").value)
         # 4x4 odom pose of the last retained keyframe's scan frame.
         self.T_last_keyframe = None
+
+        # Diagnostic-only per-stage timing, gated behind profile_timing so it
+        # is zero-overhead when disabled. Read once here (not a runtime knob;
+        # requires a relaunch to toggle) to avoid a parameter lookup on every
+        # callback in the non-profiling path.
+        self.profile = self.get_parameter("profile_timing").value
+        self._prof = {}  # stage -> [total_s, count, max_s]
+        self._prof_last_log = perf_counter()
+        self._prof_last_in_points = 0
+        self._prof_last_out_points = 0
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -120,6 +132,31 @@ class ScanAccumulator(Node):
         xyz = np.matmul(transform, xyz.T).T[:, :3]
         return np.column_stack([xyz, points[:, 3]]).astype(np.float32)
 
+    def _prof_add(self, stage, dt):
+        entry = self._prof.setdefault(stage, [0.0, 0, 0.0])
+        entry[0] += dt
+        entry[1] += 1
+        entry[2] = max(entry[2], dt)
+
+    def _prof_maybe_log(self):
+        """Emits a throttled (~5s) summary of accumulated per-stage timing.
+        Only called when profile_timing is enabled -- see cb_scan."""
+        now = perf_counter()
+        elapsed = now - self._prof_last_log
+        if elapsed < 5.0:
+            return
+        lines = [
+            f"  {stage}: mean={1000 * total / count:.2f}ms max={1000 * mx:.2f}ms n={count}"
+            for stage, (total, count, mx) in sorted(self._prof.items())
+        ]
+        self.get_logger().info(
+            "scan_accumulator profile (last {:.1f}s, points_in={}, points_out={}):\n{}".format(
+                elapsed, self._prof_last_in_points, self._prof_last_out_points, "\n".join(lines)
+            )
+        )
+        self._prof = {}
+        self._prof_last_log = now
+
     def _per_scan_filter(self, points):
         # Seam for future per-scan voxel downsampling.
         return points
@@ -161,6 +198,9 @@ class ScanAccumulator(Node):
         return math.degrees(math.acos(cos_angle)) >= self.get_parameter("keyframe_rot_deg").value
 
     def cb_scan(self, msg):
+        if self.profile:
+            t_cb_start = perf_counter()
+
         stamp = rclpy.time.Time.from_msg(msg.header.stamp)
 
         # A backward time jump (bag loop/restart) invalidates the buffer.
@@ -171,19 +211,39 @@ class ScanAccumulator(Node):
                 self.scans.clear()
                 self.T_last_keyframe = None
 
+        if self.profile:
+            t0 = perf_counter()
         T_odom_to_scan = self.lookup_mat(
             self.get_parameter("odom_frame").value, msg.header.frame_id, msg.header.stamp
         )
+        if self.profile:
+            self._prof_add("lookup_odom_scan", perf_counter() - t0)
         if T_odom_to_scan is None:
             return
 
+        if self.profile:
+            t0 = perf_counter()
         points = pc2.read_points_numpy(msg, field_names=("x", "y", "z", "intensity"))
+        if self.profile:
+            self._prof_add("read_points", perf_counter() - t0)
+            self._prof_last_in_points = len(points)
         if len(points) == 0:
             return
+
+        if self.profile:
+            t0 = perf_counter()
         points = self.transform_points(T_odom_to_scan, points)
+        if self.profile:
+            self._prof_add("transform_scan", perf_counter() - t0)
         points = self._per_scan_filter(points)
 
-        if self.is_keyframe(T_odom_to_scan):
+        if self.profile:
+            t0 = perf_counter()
+        is_kf = self.is_keyframe(T_odom_to_scan)
+        if self.profile:
+            self._prof_add("keyframe_check", perf_counter() - t0)
+
+        if is_kf:
             self.scans.append((msg.header.stamp, points))
             self.T_last_keyframe = T_odom_to_scan
             self.get_logger().debug(f"Keyframe added ({len(self.scans)} in buffer).")
@@ -193,23 +253,57 @@ class ScanAccumulator(Node):
             # the scan matcher aligns what the robot sees right now.
             self.publish_accumulated(msg.header.stamp, current_points=points)
 
+        if self.profile:
+            self._prof_add("callback_total", perf_counter() - t_cb_start)
+            self._prof_maybe_log()
+
     def publish_accumulated(self, stamp, current_points=None):
         base_frame = self.get_parameter("base_frame").value
+
+        if self.profile:
+            t0 = perf_counter()
         T_odom_to_base = self.lookup_mat(self.get_parameter("odom_frame").value, base_frame, stamp)
+        if self.profile:
+            self._prof_add("lookup_odom_base", perf_counter() - t0)
         if T_odom_to_base is None:
             return
 
         clouds = [points for _, points in self.scans]
         if current_points is not None:
             clouds.append(current_points)
+
+        if self.profile:
+            t0 = perf_counter()
         cloud = np.concatenate(clouds)
+        if self.profile:
+            self._prof_add("concatenate", perf_counter() - t0)
+
+        if self.profile:
+            t0 = perf_counter()
         cloud = self.transform_points(self.inverse_se3(T_odom_to_base), cloud)
+        if self.profile:
+            self._prof_add("transform_full", perf_counter() - t0)
+
+        if self.profile:
+            t0 = perf_counter()
         cloud = self._output_filter(cloud)
+        if self.profile:
+            self._prof_add("voxel_filter", perf_counter() - t0)
+            self._prof_last_out_points = len(cloud)
 
         header = Header()
         header.stamp = stamp
         header.frame_id = base_frame
-        self.pub_accumulated.publish(pc2.create_cloud(header, _FIELDS_XYZI, cloud))
+
+        if self.profile:
+            t0 = perf_counter()
+        cloud_msg = pc2.create_cloud(header, _FIELDS_XYZI, cloud)
+        if self.profile:
+            self._prof_add("create_cloud", perf_counter() - t0)
+            t0 = perf_counter()
+        self.pub_accumulated.publish(cloud_msg)
+        if self.profile:
+            self._prof_add("publish", perf_counter() - t0)
 
 
 def main(args=None):
