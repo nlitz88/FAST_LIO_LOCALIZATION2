@@ -27,8 +27,7 @@ _FIELDS_XYZI = [
 
 class ScanAccumulator(Node):
     """Maintains a local submap of distance-gated keyframe scans from
-    FAST-LIO and publishes it, plus the current scan, as one dense
-    "virtual scan" for the scan matcher.
+    FAST-LIO and publishes it for the scan matcher.
 
     Each incoming scan is transformed into the odom frame using the
     odom -> scan-frame tf at the scan's own timestamp. FAST-LIO's tf is
@@ -40,11 +39,13 @@ class ScanAccumulator(Node):
     roughly n_scans * keyframe_dist_m meters behind the robot, and it
     freezes (rather than flushing the trail) while the robot idles.
 
-    On every scan, keyframes + the current scan are concatenated,
-    voxel-downsampled to collapse cross-keyframe overlap (_output_filter),
-    re-expressed in base_frame at the current scan's timestamp, and
-    published -- so the scan matcher always aligns the robot's current
-    view, with the submap trail providing extra constraint.
+    The keyframe check runs right after the (cheap) tf lookup and before
+    parsing the scan's points, so a non-keyframe scan is dropped
+    immediately -- no point-cloud parsing, no transform, no publish. Only
+    when a scan is retained as a new keyframe are the buffered keyframes
+    concatenated, re-expressed in base_frame at that scan's timestamp, and
+    published -- so /accumulated_scan updates only as often as the submap
+    actually changes, not on every incoming scan.
 
     Future work:
       - per-scan voxel downsampling (_per_scan_filter) to bound memory/CPU
@@ -65,7 +66,6 @@ class ScanAccumulator(Node):
                 ("odom_frame", "odom"),
                 ("base_frame", "base_link"),
                 ("tf_timeout", 0.1),
-                ("output_voxel_size", 0.1),
                 ("profile_timing", False),
             ],
         )
@@ -161,30 +161,6 @@ class ScanAccumulator(Node):
         # Seam for future per-scan voxel downsampling.
         return points
 
-    def _output_filter(self, points):
-        """Voxel-downsamples the concatenated submap so overlapping
-        keyframes collapse to one point per cell, instead of each
-        contributing near-duplicate points. Picks one representative point
-        per occupied voxel (first occurrence) rather than a true centroid
-        average -- cheap, vectorized, and sufficient for ICP correspondence,
-        which already tolerates offsets within a voxel_size.
-
-        Voxel indices are packed into a single int64 key (21 bits/axis, safe
-        for submap extents up to ~200km at this voxel_size) and deduplicated
-        with a 1-D np.unique -- np.unique(..., axis=0) on the raw Nx3 index
-        array is a well-known ~4-5x slower path in numpy (generic lexsort)
-        for the same result."""
-        if len(points) == 0:
-            return points
-        voxel_size = self.get_parameter("output_voxel_size").value
-        if voxel_size <= 0.0:
-            return points
-        voxel_idx = np.floor(points[:, :3] / voxel_size).astype(np.int64)
-        offset = voxel_idx - voxel_idx.min(axis=0)
-        keys = (offset[:, 0] << 42) | (offset[:, 1] << 21) | offset[:, 2]
-        _, unique_indices = np.unique(keys, return_index=True)
-        return points[unique_indices]
-
     def is_keyframe(self, T_odom_to_scan):
         """True when the robot has moved far enough from the last keyframe
         that this scan adds meaningfully new geometry to the submap."""
@@ -221,6 +197,20 @@ class ScanAccumulator(Node):
         if T_odom_to_scan is None:
             return
 
+        # Keyframe check only depends on T_odom_to_scan, so it runs before
+        # the expensive parse/transform below -- a non-keyframe scan is
+        # dropped here with none of that work done, and no publish.
+        if self.profile:
+            t0 = perf_counter()
+        is_kf = self.is_keyframe(T_odom_to_scan)
+        if self.profile:
+            self._prof_add("keyframe_check", perf_counter() - t0)
+        if not is_kf:
+            if self.profile:
+                self._prof_add("callback_total", perf_counter() - t_cb_start)
+                self._prof_maybe_log()
+            return
+
         if self.profile:
             t0 = perf_counter()
         points = pc2.read_points_numpy(msg, field_names=("x", "y", "z", "intensity"))
@@ -237,27 +227,16 @@ class ScanAccumulator(Node):
             self._prof_add("transform_scan", perf_counter() - t0)
         points = self._per_scan_filter(points)
 
-        if self.profile:
-            t0 = perf_counter()
-        is_kf = self.is_keyframe(T_odom_to_scan)
-        if self.profile:
-            self._prof_add("keyframe_check", perf_counter() - t0)
-
-        if is_kf:
-            self.scans.append((msg.header.stamp, points))
-            self.T_last_keyframe = T_odom_to_scan
-            self.get_logger().debug(f"Keyframe added ({len(self.scans)} in buffer).")
-            self.publish_accumulated(msg.header.stamp)
-        else:
-            # Not retained, but the current view always heads the output so
-            # the scan matcher aligns what the robot sees right now.
-            self.publish_accumulated(msg.header.stamp, current_points=points)
+        self.scans.append((msg.header.stamp, points))
+        self.T_last_keyframe = T_odom_to_scan
+        self.get_logger().debug(f"Keyframe added ({len(self.scans)} in buffer).")
+        self.publish_accumulated(msg.header.stamp)
 
         if self.profile:
             self._prof_add("callback_total", perf_counter() - t_cb_start)
             self._prof_maybe_log()
 
-    def publish_accumulated(self, stamp, current_points=None):
+    def publish_accumulated(self, stamp):
         base_frame = self.get_parameter("base_frame").value
 
         if self.profile:
@@ -269,27 +248,19 @@ class ScanAccumulator(Node):
             return
 
         clouds = [points for _, points in self.scans]
-        if current_points is not None:
-            clouds.append(current_points)
 
         if self.profile:
             t0 = perf_counter()
         cloud = np.concatenate(clouds)
         if self.profile:
             self._prof_add("concatenate", perf_counter() - t0)
+            self._prof_last_out_points = len(cloud)
 
         if self.profile:
             t0 = perf_counter()
         cloud = self.transform_points(self.inverse_se3(T_odom_to_base), cloud)
         if self.profile:
             self._prof_add("transform_full", perf_counter() - t0)
-
-        if self.profile:
-            t0 = perf_counter()
-        cloud = self._output_filter(cloud)
-        if self.profile:
-            self._prof_add("voxel_filter", perf_counter() - t0)
-            self._prof_last_out_points = len(cloud)
 
         header = Header()
         header.stamp = stamp

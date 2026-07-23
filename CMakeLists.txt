@@ -135,9 +135,7 @@ install(PROGRAMS
   fast_lio_localization/scan_matcher.py
   fast_lio_localization/scan_accumulator.py
   fast_lio_localization/publish_initial_pose.py
-  fast_lio_localization/map_odom_broadcaster.py
   fast_lio_localization/pseudo_estimator.py
-  fast_lio_localization/invert_livox_scan.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

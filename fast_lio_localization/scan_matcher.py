@@ -39,12 +39,16 @@ class ScanMatcher(Node):
         # Latest map->base_link estimate from the global estimator, used as
         # the ICP prior. None until the first estimate arrives.
         self.T_map_to_base_prior = None
-        # Raw scan message from the most recent /accumulated_scan callback
-        # (10Hz). Only converted into an Open3D cloud on demand by
-        # get_cur_scan(), since the ~0.5Hz localization timer only ever
-        # needs the single latest one -- converting on every callback would
-        # waste ~19 out of 20 conversions.
+        # Raw scan message from the most recent /accumulated_scan callback.
+        # Only converted into an Open3D cloud on demand by get_cur_scan(),
+        # since the localization timer only ever needs the single latest
+        # one -- converting on every callback would waste conversions.
         self.latest_scan_msg = None
+        # Stamp of the scan last fed through global_localization(). Lets the
+        # timer skip ticks where /accumulated_scan hasn't produced a new
+        # scan since the last run (it now only publishes on new keyframes,
+        # so ticks can otherwise land on stale, already-processed scans).
+        self.last_processed_stamp = None
         # Static base_link <- scan frame extrinsic, cached after first lookup.
         self.T_base_to_scan_frame = None
 
@@ -151,6 +155,7 @@ class ScanMatcher(Node):
         scan_tobe_mapped, scan_stamp = self.get_cur_scan()
         if scan_tobe_mapped is None:
             return
+        self.last_processed_stamp = scan_stamp
         T_prior = self.T_map_to_base_prior
         n_scan_pts = len(scan_tobe_mapped.points)
 
@@ -274,6 +279,10 @@ class ScanMatcher(Node):
             return
         if self.latest_scan_msg is None:
             self.get_logger().info("Waiting for first scan...", throttle_duration_sec=5.0)
+            return
+        # /accumulated_scan now only publishes on a new keyframe, so ticks
+        # can land between publishes -- skip re-registering the same scan.
+        if self.latest_scan_msg.header.stamp == self.last_processed_stamp:
             return
         self.global_localization()
 
